@@ -45,8 +45,8 @@ from retail.emails import (
     render_start_work_applicant_about_to_expire, render_start_work_applicant_expired, render_start_work_approved,
     render_start_work_new_applicant, render_start_work_rejected, render_subscription_terminated_email,
     render_successful_contribution_email, render_support_cancellation_email, render_tax_report,
-    render_thank_you_for_supporting_email, render_tip_email, render_unread_notification_email_weekly_roundup,
-    render_wallpost, render_weekly_recap,
+    render_thank_you_for_supporting_email, render_tip_email, render_tribe_hackathon_prizes,
+    render_unread_notification_email_weekly_roundup, render_wallpost, render_weekly_recap,
 )
 from sendgrid.helpers.mail import Attachment, Content, Email, Mail, Personalization
 from sendgrid.helpers.stats import Category
@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 
 def send_mail(from_email, _to_email, subject, body, html=False,
-              from_name="Gitcoin.co", cc_emails=None, categories=None, debug_mode=False, zip_path=None):
+              from_name="Gitcoin.co", cc_emails=None, categories=None, debug_mode=False, zip_path=None, csv=None):
     """Send email via SendGrid."""
     # make sure this subscriber is saved
     if not settings.SENDGRID_API_KEY:
@@ -118,6 +118,17 @@ def send_mail(from_email, _to_email, subject, body, html=False,
         attachment.disposition = 'attachment'
         mail.add_attachment(attachment)
 
+    if csv is not None:
+        with open(csv, 'rb') as f:
+            data = f.read()
+            f.close()
+        encoded = base64.b64encode(data).decode()
+        attachment = Attachment()
+        attachment.content = encoded
+        attachment.type = 'text/csv'
+        attachment.filename = csv.replace('/tmp/', '')
+        attachment.disposition = 'attachment'
+        mail.add_attachment(attachment)
     # debug logs
     logger.info(f"-- Sending Mail '{subject}' to {to_email}")
     try:
@@ -131,6 +142,39 @@ def send_mail(from_email, _to_email, subject, body, html=False,
 
     return response
 
+
+def validate_email(email):
+
+    import re
+    regex = r'^[a-z0-9]+[\._]?[a-z0-9]+[@]\w+[.]\w{2,3}$'
+    if(re.search(regex,email)):
+        return True
+    return False
+
+def get_bounties_for_keywords(keywords, hours_back):
+    from dashboard.models import Bounty
+    new_bounties_pks = []
+    all_bounties_pks = []
+
+    new_bounty_cutoff = (timezone.now() - timezone.timedelta(hours=hours_back))
+    all_bounty_cutoff = (timezone.now() - timezone.timedelta(days=60))
+
+    for keyword in keywords:
+        relevant_bounties = Bounty.objects.current().filter(
+            network='mainnet',
+            idx_status__in=['open'],
+        ).keyword(keyword).exclude(bounty_reserved_for_user__isnull=False)
+        for bounty in relevant_bounties.filter(web3_created__gt=new_bounty_cutoff):
+            new_bounties_pks.append(bounty.pk)
+        for bounty in relevant_bounties.filter(web3_created__gt=all_bounty_cutoff):
+            all_bounties_pks.append(bounty.pk)
+    new_bounties = Bounty.objects.filter(pk__in=new_bounties_pks).order_by('-_val_usd_db')
+    all_bounties = Bounty.objects.filter(pk__in=all_bounties_pks).exclude(pk__in=new_bounties_pks).order_by('-_val_usd_db')
+
+    new_bounties = new_bounties.order_by('-admin_mark_as_remarket_ready')
+    all_bounties = all_bounties.order_by('-admin_mark_as_remarket_ready')
+
+    return new_bounties, all_bounties
 
 def nth_day_email_campaign(nth, subscriber):
     firstname = subscriber.email.split('@')[0]
@@ -1230,46 +1274,41 @@ def reject_faucet_request(fr):
         translation.activate(cur_language)
 
 
-def new_bounty_daily(bounties, old_bounties, to_emails=None, featured_bounties=[]):
+def new_bounty_daily(es):
+
+    to_email = es.email
+    keywords = es.keywords
+    bounties, old_bounties = get_bounties_for_keywords(keywords, 24)
     max_bounties = 5
     if len(bounties) > max_bounties:
         bounties = bounties[0:max_bounties]
-    if to_emails is None:
-        to_emails = []
-
+    to_emails = [to_email]
+    
+    from townsquare.utils import is_email_townsquare_enabled
     from marketing.views import quest_of_the_day, upcoming_grant, upcoming_hackathon, latest_activities, upcoming_dates, upcoming_dates, email_announcements
     quest = quest_of_the_day()
     grant = upcoming_grant()
     dates = list(upcoming_hackathon()) + list(upcoming_dates())
     announcements = email_announcements()
-    chats_count = 0
+    town_square_enabled = is_email_townsquare_enabled(to_email)
+    should_send = bounties.count() or town_square_enabled
+    if not should_send:
+        return False
 
     offers = f""
     if to_emails:
         offers = ""
 
         profile = email_to_profile(to_emails[0])
-        chat = ""
-        if profile:
-            try:
-                chats_count = profile.chat_num_unread_msgs
-            except:
-                chats_count = 0
-            if chats_count:
-                plural = 's' if chats_count > 1 else ''
-                chat = f"💬 {chats_count} Chat{plural}"
-
         notifications = get_notification_count(profile, 7, timezone.now())
         if notifications:
             plural = 's' if notifications > 1 else ''
-            notifications = f"🔵 {notifications} Notification{plural}"
+            notifications = f"💬 {notifications} Notification{plural}"
         else:
             notifications = ''
         has_offer = is_email_townsquare_enabled(to_emails[0]) and is_there_an_action_available()
         if has_offer:
             offers = f"⚡️ 1 New Action"
-        else:
-            offers = ""
 
         new_bounties = ""
         if bounties:
@@ -1278,7 +1317,7 @@ def new_bounty_daily(bounties, old_bounties, to_emails=None, featured_bounties=[
         elif old_bounties:
             plural_old_bounties = "Bounties" if len(old_bounties)>1 else "Bounty"
             new_bounties = f"💰{len(old_bounties)} {plural_old_bounties}"
-
+            
         new_quests = ""
         if quest:
             new_quests = f"🎯1 Quest"
@@ -1296,7 +1335,7 @@ def new_bounty_daily(bounties, old_bounties, to_emails=None, featured_bounties=[
         def comma(a):
             return ", " if a and (new_bounties or new_quests or new_dates or new_announcements or notifications) else ""
 
-        subject = f"{chat}{comma(chat)}{notifications}{comma(notifications)}{new_announcements}{comma(new_announcements)}{new_bounties}{comma(new_bounties)}{new_dates}{comma(new_dates)}{new_quests}{comma(new_quests)}{offers}{comma(True)}👤1 Trending Avatar"
+        subject = f"{notifications}{comma(notifications)}{new_announcements}{comma(new_announcements)}{new_bounties}{comma(new_bounties)}{new_dates}{comma(new_dates)}{new_quests}{comma(new_quests)}{offers}"
 
     for to_email in to_emails:
         cur_language = translation.get_language()
@@ -1308,12 +1347,13 @@ def new_bounty_daily(bounties, old_bounties, to_emails=None, featured_bounties=[
             user = User.objects.filter(email__iexact=to_email).first()
             activities = latest_activities(user)
 
-            html, text = render_new_bounty(to_email, bounties, old_bounties='', quest_of_the_day=quest, upcoming_grant=grant, upcoming_hackathon=upcoming_hackathon(), latest_activities=activities, chats_count=chats_count, featured_bounties=featured_bounties)
+            html, text = render_new_bounty(to_email, bounties, old_bounties='', quest_of_the_day=quest, upcoming_grant=grant, upcoming_hackathon=upcoming_hackathon(), latest_activities=activities)
 
             if not should_suppress_notification_email(to_email, 'new_bounty_notifications'):
                 send_mail(from_email, to_email, subject, text, html, categories=['marketing', func_name()])
         finally:
             translation.activate(cur_language)
+    return True
 
 
 def weekly_roundup(to_emails=None):
@@ -1957,3 +1997,47 @@ def remember_your_cart(profile, cart_query, grants, hours):
             send_mail(from_email, to_email, subject, text, html, categories=['marketing', func_name()])
     finally:
         translation.activate(cur_language)
+
+def tribe_hackathon_prizes(hackathon):
+    from dashboard.models import TribeMember, Sponsor
+    from marketing.utils import generate_hackathon_email_intro
+
+    sponsors = hackathon.sponsors.all()
+    tribe_members_in_sponsors = TribeMember.objects.filter(org__in=[sponsor.tribe for sponsor in sponsors]).exclude(status='rejected').exclude(profile__user=None).only('profile')
+
+    for tribe_member in tribe_members_in_sponsors.distinct('profile'):
+        tribe_member_records = tribe_members_in_sponsors.filter(profile=tribe_member.profile)
+
+        sponsors_prizes = []
+        for sponsor in sponsors.filter(tribe__in=[tribe_member_record.org for tribe_member_record in tribe_member_records]):
+            prizes = hackathon.get_current_bounties.filter(bounty_owner_profile=sponsor.tribe)
+            sponsor_prize = {
+                "sponsor": sponsor,
+                "prizes": prizes
+            }
+            sponsors_prizes.append(sponsor_prize)
+
+        subject_begin = generate_hackathon_email_intro(sponsors_prizes)
+        subject = f"{subject_begin} participating in {hackathon.name} on Gitcoin 🚀"
+
+        try:
+            html, text = render_tribe_hackathon_prizes(hackathon, sponsors_prizes, subject_begin)
+        except:
+            return
+
+        profile = tribe_member.profile
+        to_email = profile.email
+        from_email = settings.CONTACT_EMAIL
+        if not to_email:
+            if profile and profile.user:
+                to_email = profile.user.email
+        if not to_email:
+            continue
+
+        cur_language = translation.get_language()
+
+        try:
+            setup_lang(to_email)
+            send_mail(from_email, to_email, subject, text, html, categories=['marketing', func_name()])
+        finally:
+            translation.activate(cur_language)

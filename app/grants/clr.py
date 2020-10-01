@@ -221,6 +221,9 @@ def calculate_clr(aggregated_contributions, pair_totals, sms_verified_list, brig
                 elif k2 > k1:
                     tot += ((v1 * v2) ** 0.5) / (pair_totals[k1][k2] / (v_threshold * 1.125) + 1)
 
+        if type(tot) == complex:
+            tot = float(tot.real)
+
         bigtot += tot
         totals.append({'id': proj, 'number_contributions': _num, 'contribution_amount': _sum, 'clr_amount': tot})
         # totals.append({'id': proj, 'clr_amount': tot})
@@ -234,7 +237,9 @@ def calculate_clr(aggregated_contributions, pair_totals, sms_verified_list, brig
             t['clr_amount'] = ((t['clr_amount'] / bigtot) * total_pot)
     else:
         CLR_PERCENTAGE_DISTRIBUTED = (bigtot / total_pot) * 100
-        percentage_increase = np.log(total_pot / bigtot) / 100 
+        if bigtot == 0:
+            bigtot = 1
+        percentage_increase = np.log(total_pot / bigtot) / 100
         for t in totals:
             t['clr_amount'] = t['clr_amount'] * (1 + percentage_increase)
     return totals
@@ -332,7 +337,7 @@ def fetch_data(clr_round, network='mainnet'):
     grant_filters = clr_round.grant_filters
     subscription_filters = clr_round.subscription_filters
 
-    contributions = Contribution.objects.prefetch_related('subscription').filter(match=True, created_on__gte=clr_start_date, created_on__lte=clr_end_date, success=True)
+    contributions = Contribution.objects.prefetch_related('subscription').filter(match=True, created_on__gte=clr_start_date, created_on__lte=clr_end_date, success=True).nocache()
     if subscription_filters:
         contributions = contributions.filter(**subscription_filters)
 
@@ -402,8 +407,8 @@ def populate_data_for_clr(grants, contributions, phantom_funding_profiles, clr_r
         # contributions
         if len(contributing_profile_ids) > 0:
             for profile_id in contributing_profile_ids:
-                profile_contributions = contribs.filter(profile_for_clr_id=profile_id)
-                sum_of_each_profiles_contributions = float(sum([c.subscription.amount_per_period_usdt for c in profile_contributions if c.subscription.amount_per_period_usdt]))
+                profile_contributions = contribs.filter(profile_for_clr__id=profile_id)
+                sum_of_each_profiles_contributions = float(sum([c.subscription.amount_per_period_usdt * clr_round.contribution_multiplier for c in profile_contributions if c.subscription.amount_per_period_usdt]))
                 phantom_funding = grant_phantom_funding_contributions.filter(profile_id=profile_id)
                 if phantom_funding.exists():
                     sum_of_each_profiles_contributions = sum_of_each_profiles_contributions + phantom_funding.first().value
@@ -424,7 +429,7 @@ def populate_data_for_clr(grants, contributions, phantom_funding_profiles, clr_r
 
 
 
-def predict_clr(save_to_db=False, from_date=None, clr_round=None, network='mainnet'):
+def predict_clr(save_to_db=False, from_date=None, clr_round=None, network='mainnet', only_grant_pk=None):
     # setup
     clr_calc_start_time = timezone.now()
     debug_output = []
@@ -441,6 +446,9 @@ def predict_clr(save_to_db=False, from_date=None, clr_round=None, network='mainn
         return
 
     grant_contributions_curr = populate_data_for_clr(grants, contributions, phantom_funding_profiles, clr_round)
+
+    if only_grant_pk:
+        grants = grants.filter(pk=only_grant_pk)
 
     # calculate clr given additional donations
     for grant in grants:

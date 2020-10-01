@@ -19,6 +19,7 @@
 from __future__ import print_function, unicode_literals
 
 import hashlib
+import html
 import json
 import logging
 import os
@@ -36,7 +37,7 @@ from django.contrib.staticfiles.storage import staticfiles_storage
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.core.paginator import EmptyPage, PageNotAnInteger, Paginator
 from django.core.serializers.json import DjangoJSONEncoder
-from django.db.models import Avg, Count, Prefetch, Q
+from django.db.models import Avg, Count, Prefetch, Q, Sum
 from django.http import Http404, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect
 from django.template import loader
@@ -56,8 +57,12 @@ import dateutil.parser
 import magic
 import pytz
 import requests
+import tweepy
 from app.services import RedisService, TwilioService
-from app.settings import EMAIL_ACCOUNT_VALIDATION, PHONE_SALT, SMS_COOLDOWN_IN_MINUTES, SMS_MAX_VERIFICATION_ATTEMPTS
+from app.settings import (
+    EMAIL_ACCOUNT_VALIDATION, PHONE_SALT, SMS_COOLDOWN_IN_MINUTES, SMS_MAX_VERIFICATION_ATTEMPTS, TWITTER_ACCESS_SECRET,
+    TWITTER_ACCESS_TOKEN, TWITTER_CONSUMER_KEY, TWITTER_CONSUMER_SECRET,
+)
 from app.utils import clean_str, ellipses, get_default_network
 from avatar.models import AvatarTheme
 from avatar.utils import get_avatar_context_for_user
@@ -93,6 +98,8 @@ from marketing.mails import (
 )
 from marketing.models import EmailSubscriber, Keyword, UpcomingDate
 from oauth2_provider.decorators import protected_resource
+from perftools.models import JSONStore
+from ptokens.models import PersonalToken, PurchasePToken, RedemptionToken
 from pytz import UTC
 from ratelimit.decorators import ratelimit
 from rest_framework.renderers import JSONRenderer
@@ -907,7 +914,7 @@ def users_directory_elastic(request):
     return TemplateResponse(request, 'dashboard/users-elastic.html', params)
 
 
-def users_fetch_filters(profile_list, skills, bounties_completed, leaderboard_rank, rating, organisation, hackathon_id = ""):
+def users_fetch_filters(profile_list, skills, bounties_completed, leaderboard_rank, rating, organisation, hackathon_id = "", only_with_tokens = False):
     if not settings.DEBUG:
         network = 'mainnet'
     else:
@@ -950,6 +957,9 @@ def users_fetch_filters(profile_list, skills, bounties_completed, leaderboard_ra
         profile_list = profile_list.filter(
             hackathon_registration__hackathon=hackathon_id
         )
+    if only_with_tokens:
+        token_owners_profile_ids = PersonalToken.objects.filter(network=network).values_list('token_owner_profile_id', flat=True)
+        profile_list = profile_list.filter(pk__in=token_owners_profile_ids)
     return profile_list
 
 
@@ -1012,18 +1022,16 @@ def users_autocomplete(request):
         'results': results
     })
 
-
-@require_GET
+@csrf_exempt
 def output_users_to_csv(request):
 
     if request.user.is_authenticated and not request.user.is_staff:
         return Http404()
+    from .tasks import export_search_to_csv
 
-    profile_ids = request.GET.getlist('profile_ids[]')
+    export_search_to_csv.delay(body=request.body.decode('utf-8'), user_handle=request.user.profile.handle)
 
-    user_query = UserDirectory.objects.filter(profile_id__in=profile_ids)
-    from djqscsv import render_to_csv_response
-    return render_to_csv_response(user_query)
+    return JsonResponse({'message' : 'Your request is processing and will be delivered to your email'})
 
 @require_GET
 def users_fetch(request):
@@ -1042,6 +1050,7 @@ def users_fetch(request):
     tribe = request.GET.get('tribe', '')
     hackathon_id = request.GET.get('hackathon', '')
     user_filter = request.GET.get('user_filter', '')
+    only_with_tokens = request.GET.get('only_with_token', '') == 'true'
 
     user_id = request.GET.get('user', None)
     if user_id:
@@ -1099,7 +1108,8 @@ def users_fetch(request):
         leaderboard_rank,
         rating,
         organisation,
-        hackathon_id
+        hackathon_id,
+        only_with_tokens
     )
 
     def previous_worked():
@@ -1143,7 +1153,7 @@ def users_fetch(request):
         all_pages = Paginator(profile_list, limit)
         this_page = all_pages.page(page)
 
-        profile_list = Profile.objects_full.filter(pk__in=[ele for ele in this_page]).order_by('-earnings_count', 'id').exclude(handle__iexact='gitcoinbot')
+        profile_list = Profile.objects_full.filter(pk__in=[ele for ele in this_page]).order_by('-rank_coder', 'id').exclude(handle__iexact='gitcoinbot')
 
         this_page = profile_list
 
@@ -1188,6 +1198,7 @@ def users_fetch(request):
             profile_json['previously_worked'] = False # user.previous_worked_count > 0
             profile_json['position_contributor'] = user.get_contributor_leaderboard_index()
             profile_json['position_funder'] = user.get_funder_leaderboard_index()
+            profile_json['rank_coder'] = user.rank_coder
             profile_json['work_done'] = count_work_completed
             profile_json['verification'] = user.get_my_verified_check
             profile_json['avg_rating'] = user.get_average_star_rating()
@@ -2131,6 +2142,7 @@ def load_banners(request):
     return JsonResponse(response, safe=False)
 
 
+@login_required
 def profile_details(request, handle):
     """Display profile keywords.
 
@@ -2148,57 +2160,16 @@ def profile_details(request, handle):
     else:
         network = 'rinkeby'
 
-    keywords = request.GET.get('keywords', '')
-
-    bounties = Bounty.objects.current().prefetch_related(
-        'fulfillments',
-        'interested',
-        'interested__profile',
-        'feedbacks'
-        ).filter(
-            interested__profile=profile,
-            network=network,
-        ).filter(
-            interested__status='okay'
-        ).filter(
-            interested__pending=False
-        ).filter(
-            idx_status='done'
-        ).filter(
-            feedbacks__receiver_profile=profile
-        ).filter(
-            Q(metadata__issueKeywords__icontains=keywords) |
-            Q(title__icontains=keywords) |
-            Q(issue_description__icontains=keywords)
-        ).distinct('pk')[:3]
-
-    _bounties = []
-    _orgs = []
-    if bounties :
-        for bounty in bounties:
-
-            _bounty = {
-                'title': bounty.title,
-                'id': bounty.id,
-                'org': bounty.org_name,
-                'rating': [feedback.rating for feedback in bounty.feedbacks.all().distinct('bounty_id')],
-            }
-            _org = bounty.org_name
-            _orgs.append(_org)
-            _bounties.append(_bounty)
 
     response = {
         'avatar': profile.avatar_url,
         'handle': profile.handle,
-        'contributed_to': _orgs,
-        'keywords': keywords,
-        'related_bounties' : _bounties,
-        'stats': {
-            'position': profile.get_contributor_leaderboard_index(),
-            'completed_bounties': profile.completed_bounties,
-            'success_rate': profile.success_rate,
-            'earnings': profile.get_eth_sum()
-        }
+        'keywords': profile.keywords,
+        'bio': profile.bio,
+        'userOptions': profile.products_choose,
+        'jobSelected': profile.job_search_status,
+        'interestsSelected': profile.interests,
+        'contact_email': profile.contact_email,
     }
 
     return JsonResponse(response, safe=False)
@@ -2229,10 +2200,14 @@ def user_card(request, handle):
     profile_dict = profile.as_dict
     followers = TribeMember.objects.filter(org=profile).count()
     following = TribeMember.objects.filter(profile=profile).count()
+    purchased_count = PurchasePToken.objects.filter(token_holder_profile=profile, tx_status='success').count()
+    redeemed_count = RedemptionToken.objects.filter(redemption_requester=profile, tx_status='success').count()
+    has_ptoken = PersonalToken.objects.filter(token_owner_profile=profile).exists()
+
     response = {
         'is_authenticated': request.user.is_authenticated,
         'is_following': is_following,
-        'profile' : {
+        'profile': {
             'avatar_url': profile.avatar_url,
             'handle': profile.handle,
             'orgs' : profile.organizations,
@@ -2241,9 +2216,15 @@ def user_card(request, handle):
             'data': profile.data,
             'followers':followers,
             'following':following,
+            'purchased_count': purchased_count,
+            'redeemed_count': redeemed_count,
+            'has_ptoken': has_ptoken,
         },
-        'profile_dict':profile_dict
+        'profile_dict': profile_dict
     }
+    if response.get('profile',{}).get('data',{}).get('email'):
+        del response['profile']['data']['email']
+
 
     return JsonResponse(response, safe=False)
 
@@ -2696,6 +2677,8 @@ def get_profile_tab(request, profile, tab, prev_context):
     context['portfolio_count'] = len(context['portfolio']) + profile.portfolio_items.cache().count()
     context['projects_count'] = HackathonProject.objects.filter( profiles__id=profile.id).cache().count()
     context['my_kudos'] = profile.get_my_kudos.cache().distinct('kudos_token_cloned_from__name')[0:7]
+    context['projects_count'] = HackathonProject.objects.filter(profiles__id=profile.id).cache().count()
+    context['personal_tokens_count'] = PurchasePToken.objects.filter(token_holder_profile_id=profile.id).distinct('ptoken').cache().count()
     # specific tabs
     if tab == 'activity':
         all_activities = ['all', 'new_bounty', 'start_work', 'work_submitted', 'work_done', 'new_tip', 'receive_tip', 'new_grant', 'update_grant', 'killed_grant', 'new_grant_contribution', 'new_grant_subscription', 'killed_grant_contribution', 'receive_kudos', 'new_kudos', 'joined', 'updated_avatar']
@@ -2819,6 +2802,7 @@ def get_profile_tab(request, profile, tab, prev_context):
         pass
     elif tab == 'portfolio':
         title = request.POST.get('project_title')
+        pk = request.POST.get('project_pk')
         if title:
             if request.POST.get('URL')[0:4] != "http":
                 messages.error(request, 'Invalid link.')
@@ -2834,6 +2818,14 @@ def get_profile_tab(request, profile, tab, prev_context):
                     tags=request.POST.get('tags').split(','),
                     )
                 messages.info(request, 'Portfolio Item added.')
+        if pk:
+            # delete portfolio item
+            if not request.user.is_authenticated or request.user.profile.pk != profile.pk:
+                messages.error(request, 'Not Authorized')
+            pi = PortfolioItem.objects.filter(pk=pk).first()
+            if pi:
+                pi.delete()
+                messages.info(request, 'Portfolio Item has been deleted.')
     elif tab == 'earnings':
         context['earnings'] = Earning.objects.filter(to_profile=profile, network='mainnet', value_usd__isnull=False).order_by('-created_on')
     elif tab == 'spent':
@@ -2847,7 +2839,9 @@ def get_profile_tab(request, profile, tab, prev_context):
         context['sent_kudos'] = sent_kudos[0:kudos_limit]
         context['kudos_count'] = owned_kudos.count()
         context['sent_kudos_count'] = sent_kudos.count()
-
+    elif tab == 'ptokens':
+        tokens_list = PurchasePToken.objects.filter(token_holder_profile_id=profile.id).distinct('ptoken').values_list('ptoken', flat=True)
+        context['buyed_ptokens'] = PersonalToken.objects.filter(pk__in=tokens_list)
     elif tab == 'ratings':
         context['feedbacks_sent'] = [fb for fb in profile.feedbacks_sent.all() if fb.visible_to(request.user)]
         context['feedbacks_got'] = [fb for fb in profile.feedbacks_got.all() if fb.visible_to(request.user)]
@@ -2869,10 +2863,125 @@ def get_profile_tab(request, profile, tab, prev_context):
     elif tab == 'trust':
         today = datetime.today()
         context['brightid_status'] = get_brightid_status(profile.brightid_uuid)
-        context['upcoming_calls'] = UpcomingDate.objects.filter(context_tag='brightid').filter(date__gte=today).order_by('date').values()
+        if settings.DEBUG:
+            context['brightid_status'] = 'not_verified'
+
+        try:
+            context['upcoming_calls'] = JSONStore.objects.get(key='brightid_verification_parties', view='brightid_verification_parties').data
+        except JSONStore.DoesNotExist:
+            context['upcoming_calls'] = []
+
+        context['is_sms_verified'] = profile.sms_verification
+        context['is_twitter_verified'] = profile.is_twitter_verified
+        context['verify_tweet_text'] = verify_text_for_tweet(profile.handle)
     else:
         raise Http404
     return context
+
+def verify_text_for_tweet(handle):
+    url = 'https://gitcoin.co/' + handle
+    msg = 'I am verifying my identity as ' + handle + ' on @gitcoin'
+    full_text = msg + ' ' + url
+
+    return full_text
+
+@login_required
+def verify_user_twitter(request, handle):
+    MIN_FOLLOWER_COUNT = 100
+    MIN_ACCOUNT_AGE_WEEKS = 26 # ~6 months
+
+    is_logged_in_user = request.user.is_authenticated and request.user.username.lower() == handle.lower()
+    if not is_logged_in_user:
+        return JsonResponse({
+            'ok': False,
+            'msg': f'Request must be for the logged in user'
+        })
+
+    profile = profile_helper(handle, True)
+    if profile.is_twitter_verified:
+        return JsonResponse({
+            'ok': True,
+            'msg': f'User was verified previously'
+        })
+
+    request_data = json.loads(request.body.decode('utf-8'))
+    twitter_handle = request_data.get('twitter_handle', '')
+
+    if twitter_handle == '':
+        return JsonResponse({
+            'ok': False,
+            'msg': f'Request must include a Twitter handle'
+        })
+
+    auth = tweepy.OAuthHandler(TWITTER_CONSUMER_KEY, TWITTER_CONSUMER_SECRET)
+    auth.set_access_token(TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET)
+
+    try:
+        api = tweepy.API(auth)
+
+        user = api.get_user(twitter_handle)
+
+        if user.followers_count < MIN_FOLLOWER_COUNT:
+            msg = 'Sorry, you must have at least ' + str(MIN_FOLLOWER_COUNT) + ' followers'
+            return JsonResponse({
+                'ok': False,
+                'msg': msg
+            })
+
+        age = datetime.now() - user.created_at
+        if age < timedelta(days=7 * MIN_ACCOUNT_AGE_WEEKS):
+            msg = 'Sorry, your account must be at least ' + str(MIN_ACCOUNT_AGE_WEEKS) + ' weeks old'
+            return JsonResponse({
+                'ok': False,
+                'msg': msg
+            })
+
+        last_tweet = api.user_timeline(screen_name=twitter_handle, count=1, tweet_mode="extended",
+                                       include_rts=False, exclude_replies=False)[0]
+    except tweepy.TweepError:
+        return JsonResponse({
+            'ok': False,
+            'msg': f'Sorry, we couldn\'t get the last tweet from @{twitter_handle}'
+        })
+    except IndexError:
+        return JsonResponse({
+            'ok': False,
+            'msg': 'Sorry, we couldn\'t retrieve the last tweet from your timeline'
+        })
+
+    if last_tweet.retweeted or 'RT @' in last_tweet.full_text:
+        return JsonResponse({
+            'ok': False,
+            'msg': f'We get a retweet from your last status, at this moment we don\'t supported retweets.'
+        })
+
+    full_text = html.unescape(last_tweet.full_text)
+    expected_msg = verify_text_for_tweet(handle)
+
+    # Twitter replaces the URL with a shortened version, which is what it returns
+    # from the API call. So we'll split on the @-mention of gitcoin, and only compare
+    # the body of the text
+    tweet_split = full_text.split("@gitcoin")
+    expected_split = expected_msg.split("@gitcoin")
+
+    if tweet_split[0] != expected_split[0]:
+        return JsonResponse({
+            'ok': False,
+            'msg': f'Sorry, your last Tweet didn\'t match the verification text',
+            'found': tweet_split,
+            'expected': expected_split
+        })
+
+    profile.is_twitter_verified = True
+    profile.twitter_handle = twitter_handle
+    profile.save()
+
+    return JsonResponse({
+        'ok': True,
+        'msg': full_text,
+        'found': tweet_split,
+        'expected': expected_split
+    })
 
 def profile_filter_activities(activities, activity_name, activity_tabs):
     """A helper function to filter a ActivityQuerySet.
@@ -2918,7 +3027,7 @@ def profile(request, handle, tab=None):
     disable_cache = False
 
     # make sure tab param is correct
-    all_tabs = ['bounties', 'projects', 'manage', 'active', 'ratings', 'follow', 'portfolio', 'viewers', 'activity', 'resume', 'kudos', 'earnings', 'spent', 'orgs', 'people', 'grants', 'quests', 'tribe', 'hackathons', 'trust']
+    all_tabs = ['bounties', 'projects', 'manage', 'active', 'ratings', 'follow', 'portfolio', 'viewers', 'activity', 'resume', 'kudos', 'earnings', 'spent', 'orgs', 'people', 'grants', 'quests', 'tribe', 'hackathons', 'ptokens', 'trust']
     tab = default_tab if tab not in all_tabs else tab
     if handle in all_tabs and request.user.is_authenticated:
         # someone trying to go to their own profile?
@@ -2999,6 +3108,8 @@ def profile(request, handle, tab=None):
             active_tab = 2
         elif tab == "bounties":
             active_tab = 3
+        elif tab == "ptokens":
+            active_tab = 4
         context['active_panel'] = active_tab
 
         # record profile view
@@ -3069,6 +3180,21 @@ def profile(request, handle, tab=None):
     if request.user.is_authenticated and not context['is_my_profile']:
         ProfileView.objects.create(target=profile, viewer=request.user.profile)
 
+    if request.user.is_authenticated:
+        ptoken = PersonalToken.objects.filter(token_owner_profile=profile).first()
+
+        if ptoken:
+            context['ptoken'] = ptoken
+            context['total_minted'] = ptoken.total_minted
+            context['total_purchases'] = ptoken.ptoken_purchases.count()
+            context['total_redemptions'] = RedemptionToken.objects.filter(ptoken=ptoken,
+                                                                          redemption_state='completed').count()
+            context['total_holders'] = len(ptoken.get_holders())
+            context['current_hodling'] = ptoken.get_hodling_amount(request.user.profile)
+            context['locked_amount'] = RedemptionToken.objects.filter(ptoken=ptoken,
+                                                                      redemption_requester=request.user.profile,
+                                                                      redemption_state__in=['request', 'accepted', 'waiting_complete']).aggregate(locked=Sum('total'))['locked'] or 0
+            context['available_to_redeem'] = context['current_hodling'] - context['locked_amount']
 
     return TemplateResponse(request, 'profiles/profile.html', context, status=status)
 
@@ -3937,9 +4063,9 @@ def hackathon(request, hackathon='', panel='prizes'):
         active_tab = 1
     elif panel == "projects":
         active_tab = 2
-    elif panel == "chat":
-        active_tab = 3
     elif panel == "participants":
+        active_tab = 3
+    elif panel == "events":
         active_tab = 4
     elif panel == "showcase":
         active_tab = 5
@@ -4318,7 +4444,7 @@ def hackathon_save_project(request):
         project.save()
         profiles.append(str(profile.id))
         project.profiles.add(*list(filter(lambda profile_id: profile_id > 0, map(int, profiles))))
-        invalidate_obj(project.first())
+        invalidate_obj(project)
 
     return JsonResponse({
             'success': True,
@@ -4554,7 +4680,7 @@ def get_hackathons(request):
 
     if settings.DEBUG:
         from perftools.management.commands import create_page_cache
-        
+
         create_page_cache.create_hackathon_list_page_cache()
 
     tabs = [
@@ -4582,6 +4708,7 @@ def board(request):
 
     user = request.user if request.user.is_authenticated else None
     keywords = user.profile.keywords
+    ptoken = PersonalToken.objects.filter(token_owner_profile=user.profile).first()
 
     context = {
         'is_outside': True,
@@ -4591,6 +4718,7 @@ def board(request):
         'card_desc': _('Manage all your activity.'),
         'avatar_url': static('v2/images/helmet.png'),
         'keywords': keywords,
+        'ptoken': ptoken,
     }
     return TemplateResponse(request, 'board/index.html', context)
 
@@ -5922,4 +6050,115 @@ def showcase(request, hackathon):
 
     return JsonResponse({
         'success': True,
+    })
+
+
+def get_keywords(request):
+
+    if request.is_ajax():
+        q = request.GET.get('term', '').lower()
+        results = [str(key) for key in Keyword.objects.filter(keyword__istartswith=q).cache().values_list('keyword', flat=True)]
+
+        data = json.dumps(results)
+    else:
+        raise Http404
+    mimetype = 'application/json'
+    return HttpResponse(data, mimetype)
+
+
+@csrf_exempt
+@require_POST
+def onboard_save(request):
+
+    if request.user.is_authenticated:
+        profile = request.user.profile if hasattr(request.user, 'profile') else None
+        if not profile:
+            return JsonResponse(
+                { 'error': _('You must be authenticated') },
+                status=401
+            )
+        print(request.POST)
+        keywords = request.POST.getlist('skillsSelected[]')
+        bio = request.POST.get('bio')
+        interests = request.POST.getlist('interestsSelected[]')
+        userOptions = request.POST.getlist('userOptions[]')
+        jobSelected = request.POST.get('jobSelected', None)
+
+        orgSelected = request.POST.get('orgSelected')
+        if orgSelected:
+            profile.selected_persona = 'funder'
+            profile.persona_is_funder = True
+
+            orgOptions = request.POST.getlist('orgOptions[]')
+            email = request.POST.get('email')
+            try:
+                orgProfile = profile_helper(orgSelected.lower(), disable_cache=True)
+                orgProfile.products_choose = orgOptions
+                orgProfile.contact_email = email
+                orgProfile.save()
+            except (ProfileNotFoundException, ProfileHiddenException):
+                pass
+        else:
+            profile.persona_is_hunter = True
+            profile.selected_persona = 'hunter'
+
+
+        profile.products_choose = userOptions
+        profile.job_search_status = jobSelected
+        profile.keywords = keywords
+        profile.interests = interests
+        profile.bio = bio
+        profile.save()
+
+    else:
+        return JsonResponse(
+            { 'error': _('You must be authenticated') },
+            status=401
+        )
+
+    return JsonResponse(
+        {
+            'success': True,
+        },
+        status=200
+    )
+
+
+def events(request, hackathon):
+    hackathon_event = HackathonEvent.objects.filter(pk=hackathon).first()
+
+    if not hackathon_event:
+        return JsonResponse({
+            'error': True,
+            'msg': f'No exists Hackathon Event with id {hackathon}'
+        }, status=404)
+
+    calendar_unique = hackathon_event.calendar_id
+    token = settings.ADDEVENT_API_TOKEN
+    endpoint = f'https://www.addevent.com/api/v1/oe/events/list/'
+    calendar_endpoint = 'https://www.addevent.com/api/v1/me/calendars/list/'
+
+    calendar_response = requests.get(calendar_endpoint, {
+        'token': token,
+    })
+
+    calendars = calendar_response.json()["calendars"]
+    calendar_id = None
+
+    for calendar in calendars:
+        if calendar['uniquekey'] == calendar_unique:
+            calendar_id = calendar['id']
+            break
+
+    upcoming = hackathon_event.start_date.strftime('%Y-%m-%d %H:%M:%S')
+    response = requests.get(endpoint, {
+        'token': token,
+        'calendar_id': calendar_id,
+        'upcoming': upcoming
+    })
+
+    events = response.json()
+
+    return JsonResponse({
+        'events': events,
     })

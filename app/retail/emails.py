@@ -264,6 +264,34 @@ def render_tip_email(to_email, tip, is_new):
 
     return response_html, response_txt
 
+def render_tribe_hackathon_prizes(hackathon, sponsors_prizes, intro_begin):
+    email_style = 'hackathon'
+    
+    hackathon = {
+        'hackathon': hackathon,
+        'name': hackathon.name,
+        'image_url': hackathon.logo.url if hackathon.logo else f'{settings.STATIC_URL}v2/images/emails/hackathons-neg.png',
+        'url': hackathon.url,
+    }
+
+    for sponsor_prize in sponsors_prizes:
+        sponsor_prize['name'] = sponsor_prize['sponsor'].name
+        sponsor_prize['image_url'] = sponsor_prize['sponsor'].logo.url if sponsor_prize['sponsor'].logo else f'{settings.STATIC_URL}v2/images/emails/hackathons-neg.png'
+
+    intro = f"{intro_begin} participating on a new hackathon on Gitcoin: "
+
+    params = {
+        'hackathon': hackathon,
+        'sponsors_prizes': sponsors_prizes,
+        'intro': intro,
+        'email_style': email_style,
+        'hide_bottom_logo': True,
+    }
+
+    response_html = premailer_transform(render_to_string("emails/tribe_hackathon_prizes.html", params))
+    response_txt = render_to_string("emails/tribe_hackathon_prizes.txt", params)
+
+    return response_html, response_txt
 
 def render_request_amount_email(to_email, request, is_new):
 
@@ -593,6 +621,7 @@ def render_new_bounty(to_email, bounties, old_bounties, offset=3, quest_of_the_d
             'date': ele.date.strftime("%Y-%m-%d")
         }]
     upcoming_events = sorted(upcoming_events, key=lambda ele: ele['date'])
+    upcoming_events = upcoming_events[0:7]
 
     params = {
         'old_bounties': old_bounties,
@@ -1205,7 +1234,6 @@ def render_new_bounty_roundup(to_email):
     new_kudos_size_px = '300'
 
     subject = args.subject
-    new_kudos_ids = args.kudos_ids[0:-1].split(',')
     if settings.DEBUG and False:
         # for debugging email styles
         email_style = 2
@@ -1245,11 +1273,16 @@ def render_new_bounty_roundup(to_email):
     else:
         kudos_highlights = KudosTransfer.objects.exclude(network='mainnet', txid='').order_by('-created_on')[:num_kudos_to_show]
 
-    if new_kudos_ids:
-        new_kudos = Token.objects.filter(id__in=new_kudos_ids)
-    else:
-        new_kudos = None
-    print(new_kudos, new_kudos_ids)
+    new_kudos = []
+    if args.kudos:
+        for requested_kudos in args.kudos:
+            try:
+                kudos = Token.objects.get(id=requested_kudos['id'])
+                kudos.airdrop = requested_kudos.get('airdrop', f'https://gitcoin.co/kudos/{kudos.pk}/')
+                new_kudos.append(kudos)
+            except Token.DoesNotExist:
+                pass
+
 
     for key, __ in leaderboard.items():
         leaderboard[key]['items'] = LeaderboardRank.objects.active() \
@@ -1655,7 +1688,26 @@ def start_work_applicant_expired(request):
     response_html, _, _ = render_start_work_applicant_expired(interest, bounty)
     return HttpResponse(response_html)
 
+@staff_member_required
+def tribe_hackathon_prizes(request):
+    from dashboard.models import HackathonEvent
+    from marketing.utils import generate_hackathon_email_intro
 
+    hackathon = HackathonEvent.objects.filter(start_date__date=(timezone.now()+timezone.timedelta(days=3))).first()
+
+    sponsors_prizes = []
+    for sponsor in hackathon.sponsors.all()[:3]:
+        prizes = hackathon.get_current_bounties.filter(bounty_owner_profile=sponsor.tribe)
+        sponsor_prize = {
+            "sponsor": sponsor,
+            "prizes": prizes
+        }
+        sponsors_prizes.append(sponsor_prize)
+
+    intro_begin = generate_hackathon_email_intro(sponsors_prizes)
+
+    response_html, _ = render_tribe_hackathon_prizes(hackathon,sponsors_prizes, intro_begin)
+    return HttpResponse(response_html)
 
 def render_remember_your_cart(grants_query, grants, hours):
     params = {
