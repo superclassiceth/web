@@ -5041,6 +5041,7 @@ class HackathonProject(SuperModel):
     grant_link = models.ForeignKey(
         'grants.Grant',
         null=True,
+        blank=True,
         on_delete=models.SET_NULL,
         help_text=_('Link to grant if project is converted to grant') 
     )
